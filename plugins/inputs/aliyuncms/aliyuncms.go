@@ -66,7 +66,6 @@ type (
 	Metric struct {
 		ObjectsFilter                 string   `toml:"objects_filter"`
 		MetricNames                   []string `toml:"names"`
-		Service                       string   `toml:"service"`
 		Dimensions                    string   `toml:"dimensions"` //String representation of JSON dimensions
 		TagsQueryPath                 []string `toml:"tag_query_path"`
 		AllowDataPointWODiscoveryData bool     `toml:"allow_dps_without_discovery"` //Allow data points without discovery data (if no discovery data found)
@@ -298,7 +297,9 @@ func (s *AliyunMetrics) gatherMetric(acc telegraf.Accumulator, metricName string
 			var respCms cms.DescribeMetricListResponse
 			reqCms := cms.CreateDescribeMetricListRequest()
 
-			if s.rdsClient != nil && metric.Service == "rds" {
+			s.Log.Debugf("METRIC DIMENSIONS: %v\n", metric.requestDimensions)
+
+			if s.rdsClient != nil {
 				for _, instanceID := range metric.requestDimensions {
 					req := rds.CreateDescribeDBInstancePerformanceRequest()
 					req.DBInstanceId = instanceID["instanceId"]
@@ -498,6 +499,8 @@ L:
 		if metric.discoveryTags == nil {
 			metric.discoveryTags = make(map[string]map[string]string, len(s.discoveryData))
 		}
+
+		s.Log.Debugf("w %v\n", s.discoveryData)
 
 		metric.requestDimensions = nil //erasing
 		metric.requestDimensions = make([]map[string]string, 0, len(s.discoveryData))
