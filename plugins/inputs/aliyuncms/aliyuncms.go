@@ -6,13 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/jmespath/go-jmespath"
-	"reflect"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/jmespath/go-jmespath"
 
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk"
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/auth/credentials/providers"
@@ -27,6 +27,15 @@ import (
 
 //go:embed sample.conf
 var sampleConfig string
+
+// Key and service constants extracted for readability.
+const (
+	tagInstanceID  = "instanceId"
+	tagBucketName  = "BucketName"
+	tagUserID      = "userId"
+	fieldTimestamp = "timestamp"
+	serviceRDS     = "rds"
+)
 
 type (
 	// AliyunCMS is Aliyun cms config info.
@@ -272,6 +281,7 @@ func (s *AliyunCMS) Stop() {
 	}
 }
 
+// Gather given metric and emit error
 func (s *AliyunCMS) updateWindow(relativeTo time.Time) {
 	// https://help.aliyun.com/document_detail/51936.html?spm=a2c4g.11186623.6.701.54025679zh6wiR
 	// The start and end times are executed in the mode of
@@ -291,152 +301,211 @@ func (s *AliyunCMS) updateWindow(relativeTo time.Time) {
 	s.windowEnd = windowEnd
 }
 
+// getDataPoints abstracts the source selection (RDS vs CMS) and pagination token.
+func (s *AliyunCMS) getDataPoints(region, metricName string, m *metric) (points []map[string]interface{}, nextToken string, err error) {
+	if s.rdsClient != nil && slices.Contains(s.MetricServices, serviceRDS) {
+		points, err = s.fetchRDSPerformanceDatapoints(region, metricName, m)
+		// RDS branch doesn't support pagination via NextToken
+		return points, "", err
+	}
+	return s.fetchCMSDatapoints(region, metricName, m)
+}
+
+// parseTimestamp normalizes various timestamp representations into seconds since epoch.
+func (s *AliyunCMS) parseTimestamp(v interface{}) (int64, bool) {
+	switch t := v.(type) {
+	case int64:
+		return t, true
+	case float64:
+		// CMS timestamps are in ms
+		return int64(t) / 1000, true
+	case int:
+		return int64(t), true
+	case json.Number:
+		if val, err := t.Int64(); err == nil {
+			return val, true
+		}
+	default:
+	}
+	return 0, false
+}
+
+// enrichTagsWithDiscovery applies discovery tags and returns whether the datapoint should be kept.
+func (s *AliyunCMS) enrichTagsWithDiscovery(tags map[string]string, m *metric, id string) bool {
+	if m.discoveryTags == nil {
+		return true
+	}
+	disc, ok := m.discoveryTags[id]
+	if !ok && !m.AllowDataPointWODiscoveryData {
+		s.Log.Warnf("Instance %q is not found in discovery, skipping monitoring datapoint...", id)
+		return false
+	}
+	for k, v := range disc {
+		tags[k] = v
+	}
+	return true
+}
+
 // Gather given metric and emit error
-func (s *AliyunCMS) gatherMetric(acc telegraf.Accumulator, metricName string, metric *metric) error {
+func (s *AliyunCMS) gatherMetric(acc telegraf.Accumulator, metricName string, m *metric) error {
 	for _, region := range s.Regions {
 		for more := true; more; {
-			var datapoints []map[string]interface{}
-			var respCms cms.DescribeMetricListResponse
-			reqCms := cms.CreateDescribeMetricListRequest()
-
-			if s.rdsClient != nil && metric.Service == "rds" {
-				for _, instanceID := range metric.requestDimensions {
-					req := rds.CreateDescribeDBInstancePerformanceRequest()
-					req.DBInstanceId = instanceID["instanceId"]
-					req.Key = metricName
-					startTime := s.windowStart.UTC()
-					req.StartTime = fmt.Sprintf("%d-%02d-%02dT%02d:%02dZ", startTime.Year(), startTime.Month(),
-						startTime.Day(), startTime.Hour(), startTime.Minute())
-					endTime := s.windowEnd.UTC()
-					req.EndTime = fmt.Sprintf("%d-%02d-%02dT%02d:%02dZ", endTime.Year(), endTime.Month(),
-						endTime.Day(), endTime.Hour(), endTime.Minute())
-					req.RegionId = region
-
-					resp, err := s.rdsClient.DescribeDBInstancePerformance(req)
-
-					if err != nil {
-						return fmt.Errorf("failed to get the database instance performance metrics: %w", err)
-					}
-					if resp.GetHttpStatus() != 200 {
-						s.Log.Errorf("failed to get the database instance performance metrics: %v", resp.BaseResponse.GetHttpContentString())
-						break
-					}
-
-					for _, performanceKey := range resp.PerformanceKeys.PerformanceKey {
-						for _, performanceValue := range performanceKey.Values.PerformanceValue {
-							parsedTime, err := time.Parse(time.RFC3339, performanceValue.Date)
-							if err != nil {
-								return fmt.Errorf("failed to parse response performance time datapoints: %w", err)
-							}
-
-							if strings.Contains(performanceValue.Value, "&") {
-								performanceKeys := strings.Split(performanceKey.ValueFormat, "&")
-								performanceValues := strings.Split(performanceValue.Value, "&")
-
-								for i, value := range performanceValues {
-									valueAsFloat, err := strconv.ParseFloat(value, 32)
-									if err != nil {
-										return fmt.Errorf("failed to convert the performance value string to an float: %w", err)
-									}
-									datapoints = append(datapoints,
-										map[string]interface{}{
-											"instanceId":       instanceID["instanceId"],
-											performanceKeys[i]: valueAsFloat,
-											"timestamp":        parsedTime.Unix(),
-										})
-								}
-							} else {
-								valueAsFloat, err := strconv.ParseFloat(performanceValue.Value, 32)
-								if err != nil {
-									return fmt.Errorf("failed to convert the performance value string to an float: %w", err)
-								}
-								datapoints = append(datapoints,
-									map[string]interface{}{
-										"instanceId":               instanceID["instanceId"],
-										performanceKey.ValueFormat: valueAsFloat,
-										"timestamp":                parsedTime.Unix(),
-									})
-							}
-						}
-					}
-
-					if len(datapoints) == 0 {
-						s.Log.Debugf("No rds performance metrics returned from RDS, response msg: %s", resp.GetHttpContentString())
-						break
-					}
-				}
-			} else {
-				reqCms.Period = strconv.FormatInt(int64(time.Duration(s.Period).Seconds()), 10)
-				reqCms.MetricName = metricName
-				reqCms.Length = "10000"
-				reqCms.Namespace = s.Project
-				reqCms.EndTime = strconv.FormatInt(s.windowEnd.Unix()*1000, 10)
-				reqCms.StartTime = strconv.FormatInt(s.windowStart.Unix()*1000, 10)
-				reqCms.Dimensions = metric.requestDimensionsStr
-				reqCms.RegionId = region
-
-				respCms, err := s.cmsClient.DescribeMetricList(reqCms)
-
-				if err != nil {
-					return fmt.Errorf("failed to query metricName list: %w", err)
-				}
-				if respCms.Code != "200" {
-					s.Log.Errorf("failed to query metricName list: %v", respCms.Message)
-					break
-				}
-
-				if err := json.Unmarshal([]byte(respCms.Datapoints), &datapoints); err != nil {
-					return fmt.Errorf("failed to decode response datapoints: %w", err)
-				}
-
-				if len(datapoints) == 0 {
-					s.Log.Debugf("No metrics returned from CMS, response msg: %s", respCms.Message)
-					break
-				}
+			dataPoints, nextToken, err := s.getDataPoints(region, metricName, m)
+			if err != nil {
+				return err
 			}
-
+			if len(dataPoints) == 0 {
+				if s.rdsClient != nil && slices.Contains(s.MetricServices, serviceRDS) {
+					s.Log.Debug("No rds performance metrics returned from RDS")
+				} else {
+					s.Log.Debug("No metrics returned from CMS")
+				}
+				break
+			}
 		NextDataPoint:
-			for _, datapoint := range datapoints {
-				fields := make(map[string]interface{}, len(datapoint))
-				tags := make(map[string]string, len(datapoint))
-				datapointTime := int64(0)
-				for key, value := range datapoint {
-					switch key {
-					case "instanceId", "BucketName":
-						tags[key] = value.(string)
-						if metric.discoveryTags != nil { // discovery can be not activated
-							// Skipping data point if discovery data not exist
-							_, ok := metric.discoveryTags[value.(string)]
-							if !ok &&
-								!metric.AllowDataPointWODiscoveryData {
-								s.Log.Warnf("Instance %q is not found in discovery, skipping monitoring datapoint...", value.(string))
-								continue NextDataPoint
-							}
+			for _, dp := range dataPoints {
+				fields := make(map[string]interface{}, len(dp))
+				tags := make(map[string]string, len(dp))
+				var ts int64
 
-							for k, v := range metric.discoveryTags[value.(string)] {
-								tags[k] = v
-							}
+				for key, value := range dp {
+					switch key {
+					case tagInstanceID, tagBucketName:
+						strVal, ok := value.(string)
+						if !ok {
+							s.Log.Warnf("Unexpected non-string %q value in datapoint, skipping...", key)
+							continue NextDataPoint
 						}
-					case "userId":
-						tags[key] = value.(string)
-					case "timestamp":
-						if reflect.TypeOf(value).String() == "int64" {
-							datapointTime = value.(int64)
-						} else {
-							datapointTime = int64(value.(float64)) / 1000
+						tags[key] = strVal
+						if keep := s.enrichTagsWithDiscovery(tags, m, strVal); !keep {
+							continue NextDataPoint
 						}
+					case tagUserID:
+						if str, ok := value.(string); ok {
+							tags[key] = str
+						}
+					case fieldTimestamp:
+						parsed, ok := s.parseTimestamp(value)
+						if !ok {
+							s.Log.Warnf("Unexpected timestamp type %T, skipping datapoint", value)
+							continue NextDataPoint
+						}
+						ts = parsed
 					default:
 						fields[formatField(metricName, key)] = value
 					}
 				}
-				acc.AddFields(s.measurement, fields, tags, time.Unix(datapointTime, 0))
+
+				acc.AddFields(s.measurement, fields, tags, time.Unix(ts, 0))
 			}
 
-			reqCms.NextToken = respCms.NextToken
-			more = reqCms.NextToken != ""
+			more = nextToken != ""
 		}
 	}
 	return nil
+}
+
+// fetchCMSDatapoints queries CMS for datapoints and returns them along with the pagination token (if any).
+func (s *AliyunCMS) fetchCMSDatapoints(region, metricName string, metric *metric) ([]map[string]interface{}, string, error) {
+	req := cms.CreateDescribeMetricListRequest()
+	req.Period = strconv.FormatInt(int64(time.Duration(s.Period).Seconds()), 10)
+	req.MetricName = metricName
+	req.Length = "10000"
+	req.Namespace = s.Project
+	req.EndTime = strconv.FormatInt(s.windowEnd.Unix()*1000, 10)
+	req.StartTime = strconv.FormatInt(s.windowStart.Unix()*1000, 10)
+	req.Dimensions = metric.requestDimensionsStr
+	req.RegionId = region
+
+	cmsResp, err := s.cmsClient.DescribeMetricList(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to query metricName list: %w", err)
+	}
+	if cmsResp.Code != "200" {
+		s.Log.Errorf("failed to query metricName list: %v", cmsResp.Message)
+		return nil, "", nil
+	}
+
+	var dataPoints []map[string]interface{}
+	if err := json.Unmarshal([]byte(cmsResp.Datapoints), &dataPoints); err != nil {
+		return nil, "", fmt.Errorf("failed to decode response datapoints: %w", err)
+	}
+	if len(dataPoints) == 0 {
+		s.Log.Debugf("No metrics returned from CMS, response msg: %s", cmsResp.Message)
+		return nil, cmsResp.NextToken, nil
+	}
+	return dataPoints, cmsResp.NextToken, nil
+}
+
+// fetchRDSPerformanceDatapoints queries RDS performance metrics and normalizes them into CMS-like datapoints.
+func (s *AliyunCMS) fetchRDSPerformanceDatapoints(region, metricName string, metric *metric) ([]map[string]interface{}, error) {
+	var dataPoints []map[string]interface{}
+
+	for _, instanceID := range metric.requestDimensions {
+		req := rds.CreateDescribeDBInstancePerformanceRequest()
+		req.DBInstanceId = instanceID["instanceId"]
+		req.Key = metricName
+		req.StartTime = formatTimeUTC(s.windowStart)
+		req.EndTime = formatTimeUTC(s.windowEnd)
+		req.RegionId = region
+
+		resp, err := s.rdsClient.DescribeDBInstancePerformance(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get the database instance performance metrics: %w", err)
+		}
+		if resp.GetHttpStatus() != 200 {
+			s.Log.Errorf("failed to get the database instance performance metrics: %v", resp.BaseResponse.GetHttpContentString())
+			continue
+		}
+
+		for _, performanceKey := range resp.PerformanceKeys.PerformanceKey {
+			keyNames := strings.Split(performanceKey.ValueFormat, "&")
+			for _, performanceValue := range performanceKey.Values.PerformanceValue {
+				parsedTime, err := time.Parse(time.RFC3339, performanceValue.Date)
+				if err != nil {
+					return nil, fmt.Errorf("failed to parse response performance time datapoints: %w", err)
+				}
+
+				values := strings.Split(performanceValue.Value, "&")
+				if len(values) == 1 && len(keyNames) == 1 {
+					// Single value
+					valueAsFloat, err := strconv.ParseFloat(values[0], 32)
+					if err != nil {
+						return nil, fmt.Errorf("failed to convert the performance value string to an float: %w", err)
+					}
+					dataPoints = append(dataPoints, map[string]interface{}{
+						"instanceId":               instanceID["instanceId"],
+						performanceKey.ValueFormat: valueAsFloat,
+						"timestamp":                parsedTime.Unix(),
+					})
+					continue
+				}
+
+				// Multiple values with "&" separated lists
+				for i, v := range values {
+					if i >= len(keyNames) {
+						break
+					}
+					valueAsFloat, err := strconv.ParseFloat(v, 32)
+					if err != nil {
+						return nil, fmt.Errorf("failed to convert the performance value string to an float: %w", err)
+					}
+					dataPoints = append(dataPoints, map[string]interface{}{
+						"instanceId": instanceID["instanceId"],
+						keyNames[i]:  valueAsFloat,
+						"timestamp":  parsedTime.Unix(),
+					})
+				}
+			}
+		}
+	}
+
+	return dataPoints, nil
+}
+
+// formatTimeUTC formats time in the RFC3339 minute-precision expected by RDS API.
+func formatTimeUTC(t time.Time) string {
+	return t.UTC().Format("2006-01-02T15:04Z")
 }
 
 // tag helper
