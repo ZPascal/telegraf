@@ -42,7 +42,7 @@ type (
 		Period            config.Duration `toml:"period"`
 		Delay             config.Duration `toml:"delay"`
 		Project           string          `toml:"project"`
-		Metrics           []*metricDef    `toml:"metrics"`
+		Metrics           []*metric    `toml:"metrics"`
 		RateLimit         int             `toml:"ratelimit"`
 
 		Log telegraf.Logger `toml:"-"`
@@ -188,7 +188,7 @@ func (s *AliyunCMS) Gather(acc telegraf.Accumulator) error {
 		wg.Add(len(m.MetricNames))
 		for _, metricName := range m.MetricNames {
 			<-lmtr.C
-			go func(metricName string, m *metricDef) {
+			go func(metricName string, m *metric) {
 				defer wg.Done()
 				acc.AddError(s.gatherMetric(acc, metricName, m))
 			}(metricName, m)
